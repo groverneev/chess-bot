@@ -1,0 +1,6 @@
+/target
+/tools
+/data
+/bins
+*.pgn
+/nets/test

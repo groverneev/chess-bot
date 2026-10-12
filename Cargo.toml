@@ -1,0 +1,17 @@
+[package]
+name = "ferrum"
+version = "1.0.0"
+edition = "2021"
+description = "A UCI chess engine"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+
+[profile.dev]
+opt-level = 1
