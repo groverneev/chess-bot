@@ -30,6 +30,52 @@ pub struct Config {
     pub threads: usize,
 }
 
+impl Config {
+    fn validate(&self) -> Result<(), String> {
+        if self.epochs == 0 || self.batch == 0 || self.threads == 0 {
+            return Err("epochs, batch size, and threads must be positive".into());
+        }
+        if !self.lr.is_finite() || self.lr <= 0.0 || !self.final_lr.is_finite() || self.final_lr <= 0.0 {
+            return Err("learning rates must be finite and positive".into());
+        }
+        if !self.wdl.is_finite() || !(0.0..=1.0).contains(&self.wdl) {
+            return Err("wdl must be between 0 and 1".into());
+        }
+        Ok(())
+    }
+}
+
+fn load_positions(bytes: &[u8]) -> Result<Vec<PackedPos>, String> {
+    if bytes.len() % RECORD_SIZE != 0 {
+        return Err("training data contains a truncated record".into());
+    }
+    if bytes.len() / RECORD_SIZE < 2 {
+        return Err("training data needs at least two positions".into());
+    }
+    bytes
+        .chunks_exact(RECORD_SIZE)
+        .enumerate()
+        .map(|(index, record)| {
+            let position = PackedPos::from_bytes(record);
+            if !(2..=32).contains(&position.occ.count_ones()) || position.stm > 1 || position.result > 2 {
+                return Err(format!("invalid training record {index}"));
+            }
+            let mut valid = true;
+            let mut kings = [0; 2];
+            position.for_each_piece(|_, color, piece_type| {
+                valid &= piece_type < 6;
+                if piece_type == 5 {
+                    kings[color] += 1;
+                }
+            });
+            if !valid || kings != [1, 1] {
+                return Err(format!("invalid pieces in training record {index}"));
+            }
+            Ok(position)
+        })
+        .collect()
+}
+
 #[inline(always)]
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
@@ -131,6 +177,32 @@ fn train_sample(s: &Sample, params: &[f32], grad: &mut [f32]) -> f32 {
     err * err
 }
 
+fn batch_gradient(batch: &[PackedPos], params: &[f32], grads: &mut [Vec<f32>], wdl: f32) -> f64 {
+    let chunk = batch.len().div_ceil(grads.len());
+    let active = batch.len().div_ceil(chunk);
+    let grads = &mut grads[..active];
+    let loss = std::thread::scope(|scope| {
+        let handles: Vec<_> = grads
+            .iter_mut()
+            .zip(batch.chunks(chunk))
+            .map(|(gradient, part)| {
+                scope.spawn(move || {
+                    gradient.fill(0.0);
+                    part.iter().map(|position| train_sample(&decode(position, wdl), params, gradient) as f64).sum::<f64>()
+                })
+            })
+            .collect();
+        handles.into_iter().map(|handle| handle.join().unwrap()).sum()
+    });
+    let (first, rest) = grads.split_at_mut(1);
+    for gradient in rest {
+        for (total, value) in first[0].iter_mut().zip(gradient.iter()) {
+            *total += *value;
+        }
+    }
+    loss
+}
+
 fn validation_loss(val: &[PackedPos], params: &[f32], wdl: f32, threads: usize) -> f64 {
     let chunk = val.len().div_ceil(threads).max(1);
     let total: f64 = std::thread::scope(|s| {
@@ -175,16 +247,17 @@ pub fn save_quantized(params: &[f32], path: &str) {
     std::fs::write(path, out).expect("failed to write network");
 }
 
-pub fn run(cfg: Config) {
-    let bytes = std::fs::read(&cfg.data).expect("cannot read training data");
-    let n = bytes.len() / RECORD_SIZE;
-    let mut positions: Vec<PackedPos> = (0..n).map(|i| PackedPos::from_bytes(&bytes[i * RECORD_SIZE..])).collect();
+pub fn run(cfg: Config) -> Result<(), String> {
+    cfg.validate()?;
+    let bytes = std::fs::read(&cfg.data).map_err(|error| format!("cannot read training data: {error}"))?;
+    let mut positions = load_positions(&bytes)?;
+    let n = positions.len();
     drop(bytes);
     let mut rng = Rng::new(0xC0FFEE);
     for i in (1..positions.len()).rev() {
         positions.swap(i, rng.below(i + 1));
     }
-    let n_val = (n / 100).min(200_000);
+    let n_val = (n / 100).clamp(1, 200_000);
     let val = positions.split_off(n - n_val);
     let mut train = positions;
     println!("loaded {} training / {} validation positions", train.len(), val.len());
@@ -206,7 +279,6 @@ pub fn run(cfg: Config) {
     let mut grads: Vec<Vec<f32>> = (0..cfg.threads).map(|_| vec![0f32; NPARAMS]).collect();
     let (beta1, beta2, eps, decay) = (0.9f32, 0.999f32, 1e-8f32, 0.01f32);
 
-    let batches = train.len() / cfg.batch;
     let start = Instant::now();
     for epoch in 0..cfg.epochs {
         let t = epoch as f32 / (cfg.epochs - 1).max(1) as f32;
@@ -215,33 +287,10 @@ pub fn run(cfg: Config) {
             train.swap(i, rng.below(i + 1));
         }
         let mut epoch_loss = 0f64;
-        for bi in 0..batches {
-            let batch = &train[bi * cfg.batch..(bi + 1) * cfg.batch];
-            let chunk = batch.len().div_ceil(cfg.threads);
-            let params_ref = &params;
-            let wdl = cfg.wdl;
-            let loss: f64 = std::thread::scope(|s| {
-                let handles: Vec<_> = grads
-                    .iter_mut()
-                    .zip(batch.chunks(chunk))
-                    .map(|(g, part)| {
-                        s.spawn(move || {
-                            g.fill(0.0);
-                            part.iter().map(|p| train_sample(&decode(p, wdl), params_ref, g) as f64).sum::<f64>()
-                        })
-                    })
-                    .collect();
-                handles.into_iter().map(|h| h.join().unwrap()).sum()
-            });
+        for batch in train.chunks(cfg.batch) {
+            let loss = batch_gradient(batch, &params, &mut grads, cfg.wdl);
             epoch_loss += loss;
-
-            let (first, rest) = grads.split_at_mut(1);
-            let g0 = &mut first[0];
-            for g in rest.iter() {
-                for (a, b) in g0.iter_mut().zip(g.iter()) {
-                    *a += *b;
-                }
-            }
+            let g0 = &grads[0];
             let inv = 1.0 / batch.len() as f32;
             for i in 0..NPARAMS {
                 let gi = g0[i] * inv;
@@ -252,7 +301,7 @@ pub fn run(cfg: Config) {
                 params[i] = if i < B2 { p.clamp(-CLIP, CLIP) } else { p };
             }
         }
-        let train_loss = epoch_loss / (batches * cfg.batch) as f64;
+        let train_loss = epoch_loss / train.len() as f64;
         let val_loss = validation_loss(&val, &params, cfg.wdl, cfg.threads);
         println!(
             "epoch {:>3}  lr {:.6}  train {:.6}  val {:.6}  ({:.0}s)",
@@ -268,6 +317,7 @@ pub fn run(cfg: Config) {
     let final_path = format!("{}/final.nnue", cfg.out_dir);
     save_quantized(&params, &final_path);
     check_quantization(&params, &final_path, &val[..val.len().min(8)]);
+    Ok(())
 }
 
 /// Compares float and quantized integer inference on a few positions.
@@ -284,5 +334,98 @@ fn check_quantization(params: &[f32], path: &str, sample: &[PackedPos]) {
         let acc = crate::nnue::Accumulator::refresh(&net, &board);
         let q = crate::nnue::evaluate(&net, &acc, board.stm, board.occupied().count_ones());
         println!("check: float {float_cp:>8.1}  quantized {q:>6}  data {:>6}  {}", p.score, p.to_fen());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::board::Board;
+
+    fn position() -> PackedPos {
+        PackedPos::pack(&Board::from_fen("4k3/8/8/8/8/8/4P3/4K3 w - - 0 1").unwrap(), 400)
+    }
+
+    fn config() -> Config {
+        Config {
+            data: String::new(), out_dir: String::new(), epochs: 1, batch: 16384,
+            lr: 0.001, final_lr: 0.00001, wdl: 0.25, threads: 8,
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_config() {
+        let mut cfg = config();
+        assert!(cfg.validate().is_ok());
+        cfg.threads = 0;
+        assert!(cfg.validate().is_err());
+        cfg = config();
+        cfg.batch = 0;
+        assert!(cfg.validate().is_err());
+        cfg = config();
+        cfg.epochs = 0;
+        assert!(cfg.validate().is_err());
+        for value in [f32::NAN, f32::INFINITY, 0.0, -0.1] {
+            cfg = config();
+            cfg.lr = value;
+            assert!(cfg.validate().is_err());
+            cfg = config();
+            cfg.final_lr = value;
+            assert!(cfg.validate().is_err());
+        }
+        for value in [f32::NAN, f32::INFINITY, -0.1, 1.1] {
+            cfg = config();
+            cfg.wdl = value;
+            assert!(cfg.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_data() {
+        let valid = position().to_bytes().repeat(2);
+        assert_eq!(load_positions(&valid).unwrap().len(), 2);
+        assert!(load_positions(&[]).is_err());
+        assert!(load_positions(&valid[..RECORD_SIZE]).is_err());
+        assert!(load_positions(&valid[..valid.len() - 1]).is_err());
+        for (offset, value) in [(26, 3), (27, 2), (8, 7), (8, 0)] {
+            let mut invalid = valid.clone();
+            invalid[offset] = value;
+            assert!(load_positions(&invalid).is_err());
+        }
+        let mut invalid = valid;
+        invalid[..8].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(load_positions(&invalid).is_err());
+    }
+
+    #[test]
+    fn partial_batch_ignores_inactive_gradients() {
+        let params = vec![0.1; NPARAMS];
+        let mut grads = vec![vec![0.0; NPARAMS]; 8];
+        batch_gradient(&[position(); 16], &params, &mut grads, 0.25);
+        let mut expected = vec![0.0; NPARAMS];
+        let expected_loss = train_sample(&decode(&position(), 0.25), &params, &mut expected);
+        let actual_loss = batch_gradient(&[position()], &params, &mut grads, 0.25);
+        assert_eq!(actual_loss, expected_loss as f64);
+        assert_eq!(grads[0], expected);
+    }
+
+    #[test]
+    fn trains_dataset_smaller_than_batch() {
+        let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let directory = std::env::temp_dir().join(format!("ferrum-trainer-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let data = directory.join("data.bin");
+        std::fs::write(&data, position().to_bytes().repeat(4)).unwrap();
+        for batch in [16384, 2] {
+            let mut cfg = config();
+            cfg.batch = batch;
+            cfg.data = data.to_str().unwrap().into();
+            cfg.out_dir = directory.to_str().unwrap().into();
+            run(cfg).unwrap();
+            let bytes = std::fs::read(directory.join("final.nnue")).unwrap();
+            let net = crate::nnue::network_from_bytes(&bytes).unwrap();
+            assert_ne!(net.b2[output_bucket(3)], 0);
+        }
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

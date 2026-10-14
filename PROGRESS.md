@@ -1,7 +1,7 @@
 # Ferrum: progress notes and handoff
 
 Goal: build the strongest UCI chess engine we can, in Rust (std only, no crates).
-Machine: Apple M3 (aarch64, 8 cores, 16 GB). Rust 1.92. Work paused 2026-10-12.
+Machine: Apple M3 (aarch64, 8 cores, 16 GB). Rust 1.92. Last updated 2026-10-14.
 
 ## Current state (all working and verified)
 
@@ -12,10 +12,10 @@ Machine: Apple M3 (aarch64, 8 cores, 16 GB). Rust 1.92. Work paused 2026-10-12.
 | Ordering / history | Staged move picker (TT → good captures → quiets → bad captures); main, continuation (1 & 2 ply), capture histories; killer; countermove; pawn + non-pawn correction history. |
 | Eval | `hce.rs` = PeSTO tapered PSTs + bishop pair + drawish scaling. `nnue.rs` = NNUE inference, used automatically when a net is embedded at build time. |
 | UCI | `uci, isready, ucinewgame, position, go (wtime/btime/winc/binc/movestogo/movetime/depth/nodes/infinite), stop, quit, setoption (Hash, Threads, Move Overhead, Clear Hash)`, plus `d`, `eval`, `perft N`, `bench [depth]`. |
-| Tests | `cargo test --release`: perft suite, staged-gen partition, incremental hash, SEE. |
+| Tests | `cargo test --release`: 8 tests covering perft, staged-gen partition, incremental hash, SEE, trainer input validation, partial-batch gradients, and small-dataset training. |
 | Sanity | 100-game self-play at 2+0.02: no crashes, illegal moves, or time losses. Finds KQK/KRK mates. |
 
-**No NNUE has been trained on real data yet.** The released binary currently uses HCE.
+**The first real-data NNUE pilot has been trained, but rejected in testing.** The default build still uses HCE; no `nets/default.nnue` is installed.
 Strength has **not** been measured against any external engine yet.
 
 ## File map
@@ -32,6 +32,9 @@ Strength has **not** been measured against any external engine yet.
 - `bins/` (gitignored): `ferrum-v0` (first HCE build), `ferrum-datagen0` (binary used for gen0 data).
 - `data/` (gitignored): `gen0.bin` (808,960 HCE self-play positions, record-aligned), `gen0.log`, `small.bin` (disposable test snapshot).
 - `nets/test/` = toy net trained on 347K positions for 4 epochs, only to validate the pipeline. **Do not use it as a real net.**
+- `nets/net0-pilot/` (gitignored): 30 epoch checkpoints and `final.nnue` trained on all 808,960 gen0 positions. **Not a replacement for HCE:** lost the pilot match.
+- `bins/ferrum-hce-20261014`, `bins/ferrum-net0-pilot` (gitignored): baseline and embedded pilot binaries from the October 14 experiment.
+- `data/net0-pilot-train.log`, `data/net0-pilot-vs-hce.log`, `data/net0-pilot-vs-hce.pgn`, `data/net0-pilot-match-config.json` (gitignored): experiment evidence.
 
 ## Commands
 
@@ -58,6 +61,20 @@ tools/sprt.sh bins/new bins/old [tc] [elo0] [elo1] [concurrency]
 - **NNUE:** 768 inputs → 256 hidden (shared weights, two perspectives) → SCReLU → 1 output, with 8 output buckets by piece count, `(n-2)/4`. Feature = `(color^persp)*384 + type*64 + (persp==WHITE ? sq : sq^56)`. Quantization QA=255, QB=64, SCALE=400. W1 and W2 are clipped to ±1.98 during training; the NEON kernel relies on |W2_q| ≤ 127. File layout: `w1[768][H] i16, b1[H] i16, w2[8][2H] i16, b2[32] i32` (only 8 used), 402,048 bytes for H=256.
 - **Trainer:** AdamW (β 0.9/0.999, wd 0.01), batch 16384, cosine LR 1e-3 → 1e-5. Target = `(1-wdl)*sigmoid(score/400) + wdl*result`. 1% (≤200K) held out for validation. Throughput is about 230K samples/s per thread.
 
+## October 14 continuation
+
+- Fixed the trainer's dropped final batch: every training position now contributes each epoch, including datasets smaller than one batch. Gradient reduction includes only active workers, avoiding stale gradients when the last batch uses fewer threads. Loss normalization uses the actual training-set size.
+- Added configuration and record validation: reject zero epochs/batch/threads, nonfinite or invalid learning rates/WDL, truncated data, fewer than two positions, invalid piece encodings, and missing/duplicate kings. Small datasets now retain at least one validation position. CLI reports these errors with a nonzero exit status.
+- All 8 release tests pass. Existing dead-code warnings remain.
+- Pilot command: `bins/ferrum-hce-20261014 train data/gen0.bin nets/net0-pilot 30 0.001 0.25 7`. Deterministic shuffle seed `0xC0FFEE`; 800,871 training / 8,089 validation positions. Final training MSE 0.002649, validation MSE 0.003394, elapsed approximately 14 seconds. This random position split is not a game-independent holdout; validation loss alone does not establish playing strength.
+- Float versus quantized checks on 8 held-out positions differed by up to approximately 26.5 cp. This is a sample check, not exhaustive quantization validation.
+- Fixed-size comparison: **28 wins / 54 losses / 18 draws**, 37/100 points. Fastchess reported relative Elo **−92.46 ± 58.38** at `2+0.02`, one thread, 16 MB hash. This is a short-time-control pilot, not an SPRT or an absolute Elo rating. 50 paired UHO openings, seed `20261014`, concurrency 4; match took 2m31s. No recorded game ended by crash, illegal move, or time forfeit.
+- Both builds produced `Bestmove does not match beginning of last PV` warnings (125 total). Investigate interrupted-iteration reporting in `src/search.rs` separately before claiming clean UCI diagnostics.
+- Depth-12 bench: HCE 2,430,733 nodes / ~5.00M nps; pilot 2,390,715 nodes / ~4.25M nps. Different evaluation changes the search tree, so this is not a pure inference-speed comparison.
+- **Decision: keep HCE as default.** Preserve the pilot only for reproducibility; expand gen0 toward the planned 12–15M positions, retrain, and test again before promotion.
+- SHA-256 of gen0 data: `9c7395b3271906edba8870aa3b51bcb16350a7ddb8bc9b611eec24ac5bc94f49`.
+- SHA-256 of pilot final network: `6406cfc5d51243bf4609d13464a5c49d3cd892a4cf4950da8371bcd85313a69c`.
+
 ## Measured numbers
 
 - Bench (depth 13, HCE, idle machine): 3.65M nodes, ~6.1M nps single thread.
@@ -67,7 +84,7 @@ tools/sprt.sh bins/new bins/old [tc] [elo0] [elo1] [concurrency]
 ## Next steps (planned order)
 
 1. **Generate gen0 data.** Resume with `bins/ferrum-datagen0 datagen 7 <N> data/gen0.bin 5000` (appends). Plan was ~12–15M positions total, about 2 hours, then stop. Already have 0.81M.
-2. **Train net0:** `ferrum train data/gen0.bin nets/net0 30`. Copy `final.nnue` to `nets/default.nnue` and rebuild. SPRT it against `bins/ferrum-v0` (HCE); expect a large gain (+200 Elo or more).
+2. **Train net0 on the expanded dataset:** `ferrum train data/gen0.bin nets/net0 30`. Build a candidate with `FERRUM_NET=nets/net0/final.nnue cargo build --release`, save its binary, and test against HCE. Install `nets/default.nnue` only after a convincing strength gain; the 0.81M-position pilot regressed.
 3. **gen1 data:** self-play with the net0 engine (30M+ positions). Train net1 on gen1 (optionally + gen0). Consider H=512, horizontal mirroring, and later king input buckets; SPRT each change.
 4. **Search improvements** (SPRT each, after NNUE is in, since tuning depends on eval): ProbCut; continuation history at ply 4; deeper/shallower re-search after LMR; using eval differences to update the previous move's quiet history; check-extension variants; pruning margins and LMR constants (or SPSA); quiet check-evasion pruning in qsearch.
 5. **Calibrate strength** against Stockfish with `UCI_LimitStrength` / `UCI_Elo` (would need building Stockfish locally) to give the user an Elo estimate. Then write the README.
@@ -78,4 +95,5 @@ tools/sprt.sh bins/new bins/old [tc] [elo0] [elo1] [concurrency]
 - `see_ge` returns `0 >= threshold` for castling, en passant and promotions (Stockfish-style simplification).
 - TT stores eval-only entries (`BOUND_NONE`) at nodes without a TT hit, so `hashfull` fills quickly; this is intended.
 - No pondering, MultiPV, Chess960, Syzygy, or `EvalFile` option yet.
-- The git repo was created by `cargo init`. **Nothing has been committed**; the user has not asked for commits.
+- Interrupted searches can produce bestmove/last-PV reporting mismatches in both HCE and NNUE builds; see the October 14 match logs.
+- The repo has an initial commit (`f0b7861`). No commits were created during the October 14 continuation; the user has not asked for new commits.
