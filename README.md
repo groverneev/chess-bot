@@ -18,7 +18,7 @@ cargo test --release
 (and may only run on) the machine that built it.
 
 The build embeds `nets/default.nnue` (a 768→256×2→1 network trained on
-6M positions of Ferrum's own self-play; see `PROGRESS.md` for match results), or the
+9M positions of Ferrum's own self-play; see `PROGRESS.md` for match results), or the
 file named by `FERRUM_NET`. If the file can't be read, Ferrum falls back to
 its hand-crafted evaluation.
 

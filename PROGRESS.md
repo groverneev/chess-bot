@@ -10,12 +10,12 @@ Machines: Apple M3 (aarch64, 8 cores, 16 GB, Rust 1.92) through October 14; Octo
 | Move generation | Legal-only bitboard movegen with check/pin masks. Magic sliders generated at **build time** (`build.rs`). Perft passes all 6 standard positions (~540 Mnps bulk). |
 | Search | PVS + iterative deepening + aspiration windows, lock-free shared TT (4-way buckets), Lazy SMP. Pruning: RFP, razoring, NMP, LMP, futility, SEE pruning, history pruning, IIR. Extensions: in-check, singular (incl. double ext + multicut + negative ext). LMR with history/killer/check/cutnode adjustments. Quiescence with SEE + delta pruning. |
 | Ordering / history | Staged move picker (TT → good captures → quiets → bad captures); main, continuation (1 & 2 ply), capture histories; killer; countermove; pawn + non-pawn correction history. |
-| Eval | **Default: NNUE `nets/default.nnue` (net2m-e8, Oct 16): +69 Elo over net1m-e8, which was +157 over HCE.** `hce.rs` = PeSTO tapered PSTs + bishop pair + drawish scaling, used when no net is embedded. |
+| Eval | **Default: NNUE `nets/default.nnue` (net3m-e10, Oct 16).** Chain of SPRT wins: net1m-e8 +157 over HCE, net2m-e8 +69 over net1m-e8, net3m-e10 +51 over net2m-e8. `hce.rs` = PeSTO tapered PSTs + bishop pair + drawish scaling, used when no net is embedded. |
 | UCI | `uci, isready, ucinewgame, position, go (wtime/btime/winc/binc/movestogo/movetime/depth/nodes/infinite), stop, quit, setoption (Hash, Threads, Move Overhead, Clear Hash)`, plus `d`, `eval`, `perft N`, `bench [depth]`. |
 | Tests | `cargo test --release`: 9 tests covering perft, staged-gen partition, incremental hash, SEE, trainer input validation, partial-batch gradients, small-dataset training, and mirror augmentation. |
-| Sanity | 100-game self-play at 2+0.02: no crashes, illegal moves, or time losses. Finds KQK/KRK mates. Bench signature (depth 12, default net): **2,287,175 nodes**; HCE build (`FERRUM_NET=none cargo build --release`): 2,430,733. |
+| Sanity | 100-game self-play at 2+0.02: no crashes, illegal moves, or time losses. Finds KQK/KRK mates. Bench signature (depth 12, default net): **2,360,300 nodes**; HCE build (`FERRUM_NET=none cargo build --release`): 2,430,733. |
 
-**NNUE is now the default** (`nets/default.nnue`, committed). net1m-e8 beat HCE by **+156.6 ± 35.0 Elo**; the current net2m-e8 beat net1m-e8 by **+69.2 ± 22.0 Elo** (both SPRTs at 8+0.08). See the October 16 section.
+**NNUE is now the default** (`nets/default.nnue`, committed). net1m-e8 beat HCE by **+156.6 ± 35.0 Elo**; net2m-e8 beat net1m-e8 by **+69.2 ± 22.0**; the current net3m-e10 beat net2m-e8 by **+50.5 ± 20.1** (all SPRTs at 8+0.08). See the October 16 section.
 Strength has **not** been measured against any external engine yet.
 
 ## File map
@@ -102,14 +102,23 @@ Work is on branch `ferrum-continue`. The October 14 `data/`, `bins/`, `tools/` a
 - **Promoted** `nets/net1m-e8/final.nnue` to `nets/default.nnue` (SHA-256 `4912a4fc4bfa370ab366e1418cf3e73f71c3c63f28c8d5164001b2b74307a948`). A plain `cargo build --release` produces a binary byte-identical to the tested candidate.
 - Reproduce: `ferrum train data/gen0.bin nets/net1m-e8 8 0.001 0.25 4 mirror` (deterministic given the same data and thread count).
 
-### Second generation (net2m-e8, now the default)
+### Second generation (net2m-e8)
 
 - **gen1 data:** `ferrum datagen 4 3000000 data/gen1.bin 5000` with the net1m-e8 default build → 3,000,469 positions from 30,186 games in 4,820 s (~620 pos/s). SHA-256 `1ead519d7d51aaecd0b33d08857602ce57da8810883fc17f09b1e0d5ae46f602`.
 - Trained on `cat gen0.bin gen1.bin > gen01.bin` (6.0M positions; validation = last 60K, i.e. gen1 games). Final held-out loss: net2m-e8 (8 epochs, mirror) 0.007781; net2m-e12 0.007781; gen1-only 8 epochs 0.007962. These use a different validation set from the net1 table, so the numbers are not comparable across tables.
 - **SPRT net2m-e8 vs net1m-e8**, 8+0.08, same settings as above, bounds [0, 10]: **H1 accepted** after 402 games. +152 −73 =177, **Elo +69.18 ± 22.04**, nElo 109.6 ± 34.0, pentanomial [6, 20, 80, 79, 16]. No crashes, time losses, illegal moves, or PV warnings. 45 minutes.
 - **Promoted** to `nets/default.nnue` (SHA-256 `45ca372547bd170e098e5750f2847cafbaacada3b5599bada7023cf0f9f43023`); default build is byte-identical to the tested candidate. Bench depth 12: 2,287,175 nodes.
 - Reproduce: `ferrum train data/gen01.bin nets/net2m-e8 8 0.001 0.25 4 mirror`.
-- Elo gains are relative to the previous default and are not additive measurements against HCE; net2m-e8 has not been played directly against HCE.
+- Elo gains are relative to the previous default and are not additive measurements against HCE; later nets have not been played directly against HCE.
+
+### Third generation (net3m-e10, now the default)
+
+- **gen2 data:** `ferrum datagen 4 3000000 data/gen2.bin 5000` with the net2m-e8 default build → 3,000,448 positions from 31,179 games in 4,698 s. SHA-256 `e4d8d3cd36b91892c6a79ff7b9902efb2fdca2246c83d5676ccb446b51f59df1`.
+- Trained on `cat gen0.bin gen1.bin gen2.bin > gen012.bin` (9.0M positions; validation = last 90K, i.e. gen2 games). Final held-out loss: 8 epochs 0.008158; **10 epochs 0.008108** (chosen).
+- **SPRT net3m-e10 vs net2m-e8**, 8+0.08, bounds [0, 10]: **H1 accepted** after 554 games. +195 −115 =244, **Elo +50.52 ± 20.07**, nElo 74.0 ± 28.9, pentanomial [9, 44, 110, 86, 28]. No crashes, time losses, illegal moves, or PV warnings. 61 minutes.
+- **Promoted** to `nets/default.nnue` (SHA-256 `b7f60503d56b4317bd8afb6db5e440c1bbd8f735bcdfefa925565c7287b0a75e`); default build byte-identical to the tested candidate. Bench depth 12: 2,360,300 nodes.
+- Reproduce: `ferrum train data/gen012.bin nets/net3m-e10 10 0.001 0.25 4 mirror`.
+- Gains per added 3M positions are shrinking (+69, then +51) but still large. Next levers: keep adding data, then try H=512 once the dataset is big enough to support it.
 
 ## Measured numbers
 
@@ -120,7 +129,7 @@ Work is on branch `ferrum-continue`. The October 14 `data/`, `bins/`, `tools/` a
 ## Next steps (planned order)
 
 1. ~~Generate gen0 data and train a net that beats HCE.~~ Done October 16 (3M positions, +157 Elo).
-2. ~~gen1 data + net2.~~ Done October 16 (+69 Elo). **Continue the loop:** gen2 with the net2m-e8 engine, train on gen0+gen1+gen2, SPRT against the default. More data is clearly the main lever (3M→6M gave +69). The gen0/gen1 files lived only in the cloud container, so on a new machine regenerate rather than expect them to exist.
+2. ~~gen1 data + net2; gen2 + net3.~~ Done October 16 (+69, then +51 Elo). **Continue the loop:** gen3 with the net3m-e10 engine, train on all data, SPRT against the default. More data is clearly the main lever (3M→6M gave +69). The gen0/gen1 files lived only in the cloud container, so on a new machine regenerate rather than expect them to exist.
 3. **Architecture:** H=512, king input buckets; SPRT each change. Mirror augmentation is already in.
 4. **Search improvements** (SPRT each, after NNUE is in, since tuning depends on eval): ProbCut; continuation history at ply 4; deeper/shallower re-search after LMR; using eval differences to update the previous move's quiet history; check-extension variants; pruning margins and LMR constants (or SPSA); quiet check-evasion pruning in qsearch.
 5. **Calibrate strength** against Stockfish with `UCI_LimitStrength` / `UCI_Elo` (would need building Stockfish locally) to give the user an Elo estimate. Then write the README.
