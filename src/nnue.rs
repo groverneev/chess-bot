@@ -167,7 +167,33 @@ fn screlu_dot(acc: &[i16; HIDDEN], w: &[i16]) -> i32 {
     }
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+/// AVX2 version of the same kernel: madd sums adjacent (clamp(acc) * w) * clamp(acc) products.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn screlu_dot(acc: &[i16; HIDDEN], w: &[i16]) -> i32 {
+    use std::arch::x86_64::*;
+    assert!(w.len() >= HIDDEN);
+    // SAFETY: AVX2 is enabled at compile time; all loads stay within HIDDEN elements.
+    unsafe {
+        let zero = _mm256_setzero_si256();
+        let qa = _mm256_set1_epi16(QA as i16);
+        let mut s = _mm256_setzero_si256();
+        let mut i = 0;
+        while i < HIDDEN {
+            let a = _mm256_loadu_si256(acc.as_ptr().add(i) as *const __m256i);
+            let x = _mm256_min_epi16(_mm256_max_epi16(a, zero), qa);
+            let xw = _mm256_mullo_epi16(x, _mm256_loadu_si256(w.as_ptr().add(i) as *const __m256i));
+            s = _mm256_add_epi32(s, _mm256_madd_epi16(xw, x));
+            i += 16;
+        }
+        let s = _mm_add_epi32(_mm256_castsi256_si128(s), _mm256_extracti128_si256::<1>(s));
+        let s = _mm_add_epi32(s, _mm_unpackhi_epi64(s, s));
+        let s = _mm_add_epi32(s, _mm_shuffle_epi32::<1>(s));
+        _mm_cvtsi128_si32(s)
+    }
+}
+
+#[cfg(not(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "avx2"))))]
 #[inline(always)]
 fn screlu_dot(acc: &[i16; HIDDEN], w: &[i16]) -> i32 {
     let mut sum = 0i32;
