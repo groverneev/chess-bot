@@ -28,6 +28,8 @@ pub struct Config {
     pub final_lr: f32,
     pub wdl: f32,
     pub threads: usize,
+    /// Randomly mirror training positions across the d/e file boundary (data augmentation).
+    pub mirror: bool,
 }
 
 impl Config {
@@ -96,9 +98,11 @@ struct Sample {
     target: f32,
 }
 
-fn decode(p: &PackedPos, wdl: f32) -> Sample {
+fn decode(p: &PackedPos, wdl: f32, mirror: bool) -> Sample {
     let mut s = Sample { fw: [0; 32], fb: [0; 32], n: 0, stm: p.stm as usize, bucket: 0, target: 0.0 };
+    let flip = if mirror { 7 } else { 0 };
     p.for_each_piece(|sq, c, pt| {
+        let sq = sq ^ flip;
         s.fw[s.n] = (c * 384 + pt * 64 + sq) as u16;
         s.fb[s.n] = ((c ^ 1) * 384 + pt * 64 + (sq ^ 56)) as u16;
         s.n += 1;
@@ -177,7 +181,13 @@ fn train_sample(s: &Sample, params: &[f32], grad: &mut [f32]) -> f32 {
     err * err
 }
 
-fn batch_gradient(batch: &[PackedPos], params: &[f32], grads: &mut [Vec<f32>], wdl: f32) -> f64 {
+/// Deterministic per-epoch coin flip for mirroring a position.
+#[inline(always)]
+fn mirrored(p: &PackedPos, seed: u64) -> bool {
+    (p.occ ^ seed).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 63 == 1
+}
+
+fn batch_gradient(batch: &[PackedPos], params: &[f32], grads: &mut [Vec<f32>], wdl: f32, mirror_seed: Option<u64>) -> f64 {
     let chunk = batch.len().div_ceil(grads.len());
     let active = batch.len().div_ceil(chunk);
     let grads = &mut grads[..active];
@@ -188,7 +198,12 @@ fn batch_gradient(batch: &[PackedPos], params: &[f32], grads: &mut [Vec<f32>], w
             .map(|(gradient, part)| {
                 scope.spawn(move || {
                     gradient.fill(0.0);
-                    part.iter().map(|position| train_sample(&decode(position, wdl), params, gradient) as f64).sum::<f64>()
+                    part.iter()
+                        .map(|position| {
+                            let mirror = mirror_seed.is_some_and(|seed| mirrored(position, seed));
+                            train_sample(&decode(position, wdl, mirror), params, gradient) as f64
+                        })
+                        .sum::<f64>()
                 })
             })
             .collect();
@@ -214,7 +229,7 @@ fn validation_loss(val: &[PackedPos], params: &[f32], wdl: f32, threads: usize) 
                     let mut ab = [0f32; H];
                     part.iter()
                         .map(|p| {
-                            let smp = decode(p, wdl);
+                            let smp = decode(p, wdl, false);
                             let e = forward(&smp, params, &mut aw, &mut ab) - smp.target;
                             (e * e) as f64
                         })
@@ -253,13 +268,12 @@ pub fn run(cfg: Config) -> Result<(), String> {
     let mut positions = load_positions(&bytes)?;
     let n = positions.len();
     drop(bytes);
-    let mut rng = Rng::new(0xC0FFEE);
-    for i in (1..positions.len()).rev() {
-        positions.swap(i, rng.below(i + 1));
-    }
+    // Datagen writes whole games contiguously, so holding out the tail of the file (before
+    // shuffling) keeps validation games out of the training set, apart from one boundary game.
     let n_val = (n / 100).clamp(1, 200_000);
     let val = positions.split_off(n - n_val);
     let mut train = positions;
+    let mut rng = Rng::new(0xC0FFEE);
     println!("loaded {} training / {} validation positions", train.len(), val.len());
     std::fs::create_dir_all(&cfg.out_dir).unwrap();
 
@@ -288,7 +302,8 @@ pub fn run(cfg: Config) -> Result<(), String> {
         }
         let mut epoch_loss = 0f64;
         for batch in train.chunks(cfg.batch) {
-            let loss = batch_gradient(batch, &params, &mut grads, cfg.wdl);
+            let mirror_seed = cfg.mirror.then(|| rng.next_u64());
+            let loss = batch_gradient(batch, &params, &mut grads, cfg.wdl, mirror_seed);
             epoch_loss += loss;
             let g0 = &grads[0];
             let inv = 1.0 / batch.len() as f32;
@@ -327,7 +342,7 @@ fn check_quantization(params: &[f32], path: &str, sample: &[PackedPos]) {
     let mut aw = [0f32; H];
     let mut ab = [0f32; H];
     for p in sample {
-        let smp = decode(p, 0.0);
+        let smp = decode(p, 0.0, false);
         let pred = forward(&smp, params, &mut aw, &mut ab);
         let float_cp = (pred / (1.0 - pred)).ln() * EVAL_SCALE;
         let board = crate::board::Board::from_fen(&p.to_fen()).unwrap();
@@ -349,8 +364,23 @@ mod tests {
     fn config() -> Config {
         Config {
             data: String::new(), out_dir: String::new(), epochs: 1, batch: 16384,
-            lr: 0.001, final_lr: 0.00001, wdl: 0.25, threads: 8,
+            lr: 0.001, final_lr: 0.00001, wdl: 0.25, threads: 8, mirror: false,
         }
+    }
+
+    #[test]
+    fn mirroring_matches_mirrored_position() {
+        let pack = |fen: &str| PackedPos::pack(&Board::from_fen(fen).unwrap(), -35);
+        let features = |s: &Sample| {
+            let (mut w, mut b) = (s.fw[..s.n].to_vec(), s.fb[..s.n].to_vec());
+            w.sort_unstable();
+            b.sort_unstable();
+            (w, b, s.stm, s.bucket, s.target)
+        };
+        let original = pack("r3k2r/pb1n1ppp/1p6/2pP4/8/2N2N2/PP3PPP/R2QK2R b KQkq - 1 12");
+        let mirrored = pack("r2k3r/ppp1n1bp/6p1/4Pp2/8/2N2N2/PPP3PP/R2KQ2R b - - 1 12");
+        assert_eq!(features(&decode(&original, 0.25, true)), features(&decode(&mirrored, 0.25, false)));
+        assert_ne!(features(&decode(&original, 0.25, false)), features(&decode(&mirrored, 0.25, false)));
     }
 
     #[test]
@@ -401,10 +431,10 @@ mod tests {
     fn partial_batch_ignores_inactive_gradients() {
         let params = vec![0.1; NPARAMS];
         let mut grads = vec![vec![0.0; NPARAMS]; 8];
-        batch_gradient(&[position(); 16], &params, &mut grads, 0.25);
+        batch_gradient(&[position(); 16], &params, &mut grads, 0.25, None);
         let mut expected = vec![0.0; NPARAMS];
-        let expected_loss = train_sample(&decode(&position(), 0.25), &params, &mut expected);
-        let actual_loss = batch_gradient(&[position()], &params, &mut grads, 0.25);
+        let expected_loss = train_sample(&decode(&position(), 0.25, false), &params, &mut expected);
+        let actual_loss = batch_gradient(&[position()], &params, &mut grads, 0.25, None);
         assert_eq!(actual_loss, expected_loss as f64);
         assert_eq!(grads[0], expected);
     }

@@ -32,7 +32,7 @@ fn main() {
         }
         Some("train") => {
             if let Err(error) = trainer::run(trainer::Config {
-                data: arg(2).expect("usage: train <data> <out-dir> [epochs] [lr] [wdl] [threads]").to_string(),
+                data: arg(2).expect("usage: train <data> <out-dir> [epochs] [lr] [wdl] [threads] [mirror]").to_string(),
                 out_dir: arg(3).unwrap_or("nets/run").to_string(),
                 epochs: arg(4).and_then(|s| s.parse().ok()).unwrap_or(30),
                 batch: 16384,
@@ -40,6 +40,7 @@ fn main() {
                 final_lr: 0.00001,
                 wdl: arg(6).and_then(|s| s.parse().ok()).unwrap_or(0.25),
                 threads: arg(7).and_then(|s| s.parse().ok()).unwrap_or(8),
+                mirror: arg(8) == Some("mirror"),
             }) {
                 eprintln!("training error: {error}");
                 std::process::exit(1);
