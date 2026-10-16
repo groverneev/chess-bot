@@ -1,7 +1,7 @@
 # Ferrum: progress notes and handoff
 
 Goal: build the strongest UCI chess engine we can, in Rust (std only, no crates).
-Machine: Apple M3 (aarch64, 8 cores, 16 GB). Rust 1.92. Last updated 2026-10-14.
+Machines: Apple M3 (aarch64, 8 cores, 16 GB, Rust 1.92) through October 14; October 16 work ran in a 4-core x86_64 Xeon cloud container (AVX-512, Rust 1.97). Last updated 2026-10-16.
 
 ## Current state (all working and verified)
 
@@ -12,7 +12,7 @@ Machine: Apple M3 (aarch64, 8 cores, 16 GB). Rust 1.92. Last updated 2026-10-14.
 | Ordering / history | Staged move picker (TT → good captures → quiets → bad captures); main, continuation (1 & 2 ply), capture histories; killer; countermove; pawn + non-pawn correction history. |
 | Eval | `hce.rs` = PeSTO tapered PSTs + bishop pair + drawish scaling. `nnue.rs` = NNUE inference, used automatically when a net is embedded at build time. |
 | UCI | `uci, isready, ucinewgame, position, go (wtime/btime/winc/binc/movestogo/movetime/depth/nodes/infinite), stop, quit, setoption (Hash, Threads, Move Overhead, Clear Hash)`, plus `d`, `eval`, `perft N`, `bench [depth]`. |
-| Tests | `cargo test --release`: 8 tests covering perft, staged-gen partition, incremental hash, SEE, trainer input validation, partial-batch gradients, and small-dataset training. |
+| Tests | `cargo test --release`: 9 tests covering perft, staged-gen partition, incremental hash, SEE, trainer input validation, partial-batch gradients, small-dataset training, and mirror augmentation. |
 | Sanity | 100-game self-play at 2+0.02: no crashes, illegal moves, or time losses. Finds KQK/KRK mates. |
 
 **The first real-data NNUE pilot has been trained, but rejected in testing.** The default build still uses HCE; no `nets/default.nnue` is installed.
@@ -24,11 +24,12 @@ Strength has **not** been measured against any external engine yet.
 - `src/types.rs`, `attacks.rs`, `zobrist.rs`, `moves.rs` (16-bit move: from|to|4-bit flag), `board.rs` (copy-make `Board`, FEN, SEE), `movegen.rs` (+ perft, tests).
 - `src/search.rs`: `Worker` (per thread), `Shared` (TT, stop flag, node counters). `src/movepick.rs`, `history.rs`, `tt.rs`, `timeman.rs`.
 - `src/eval.rs`: `Evaluator` front-end. Lazy accumulator stack: `push_move` / `push_null` record deltas, `evaluate` catches up. Has a `debug_assert` comparing against a full refresh. 50-move fade applied.
-- `src/nnue.rs`: arch constants, `Network` layout, NEON SCReLU kernel (scalar fallback for non-aarch64).
+- `src/nnue.rs`: arch constants, `Network` layout, NEON and AVX2 SCReLU kernels (scalar fallback otherwise).
 - `src/data.rs`: 32-byte `PackedPos` training record.
 - `src/datagen.rs`: self-play data generator. `src/trainer.rs`: multi-threaded CPU NNUE trainer.
 - `src/bench.rs`: 35 bench FENs. `src/uci.rs`: engine front-end (search runs on its own thread; helpers via `thread::scope`, 64 MB stacks).
-- `tools/` (gitignored): `fastchess/fastchess` (built from source), `books/UHO_Lichess_4852_v1.epd` + `8moves_v3.pgn`, `sprt.sh`.
+- `scripts/sprt.sh` (fastchess SPRT wrapper) and `scripts/pvcheck.py` (bestmove/PV consistency check).
+- `tools/` (gitignored): `fastchess/fastchess` (built from source: `git clone https://github.com/Disservin/fastchess && make -j`), `books/UHO_Lichess_4852_v1.epd` + `8moves_v3.pgn` (unzipped from `official-stockfish/books`).
 - `bins/` (gitignored): `ferrum-v0` (first HCE build), `ferrum-datagen0` (binary used for gen0 data).
 - `data/` (gitignored): `gen0.bin` (808,960 HCE self-play positions, record-aligned), `gen0.log`, `small.bin` (disposable test snapshot).
 - `nets/test/` = toy net trained on 347K positions for 4 epochs, only to validate the pipeline. **Do not use it as a real net.**
@@ -47,11 +48,13 @@ cargo test --release
 # Self-play data (appends to file; target counts only this run's positions)
 ./target/release/ferrum datagen <threads> <positions> <out.bin> [soft_nodes=5000]
 
-# Train: writes <out>/epochN.nnue and final.nnue, then prints float-vs-quantized checks
-./target/release/ferrum train <data.bin> <out-dir> [epochs=30] [lr=0.001] [wdl=0.25] [threads=8]
+# Train: writes <out>/epochN.nnue and final.nnue, then prints float-vs-quantized checks.
+# Validation = last 1% of the file (whole games), taken before shuffling. `mirror` = file-flip augmentation.
+./target/release/ferrum train <data.bin> <out-dir> [epochs=30] [lr=0.001] [wdl=0.25] [threads=8] [mirror]
 
-# SPRT: new vs old binary (default 8+0.08, elo0=0 elo1=5, concurrency 7)
-tools/sprt.sh bins/new bins/old [tc] [elo0] [elo1] [concurrency]
+# SPRT: new vs old binary (default 8+0.08, elo0=0 elo1=5, concurrency nproc-1)
+scripts/sprt.sh bins/new bins/old [tc] [elo0] [elo1] [concurrency]
+scripts/pvcheck.py target/release/ferrum      # bestmove must match the last reported PV
 ```
 
 ## Formats
@@ -59,7 +62,7 @@ tools/sprt.sh bins/new bins/old [tc] [elo0] [elo1] [concurrency]
 - **Training record (32 bytes, LE):** `occ u64` | 16 bytes of 4-bit pieces in ascending-square order (`color<<3 | type`) | `score i16` (cp, **White POV**) | `result u8` (0 black win, 1 draw, 2 white win) | `stm u8` | 4 bytes padding.
 - **Datagen policy:** 8–9 random opening plies; reject if a 20K-node search gives |score| > 1000. Then 5000 soft nodes per move (hard cap 100K). Positions are recorded only when the side to move is not in check, the best move is quiet, and the score is not a mate score. Games are adjudicated as a win after |score| ≥ 2000 for 6 plies or any mate score, and as a draw after ply ≥ 80 with |score| ≤ 10 for 12 plies, or by 3-fold, 50-move, insufficient material, or 600 plies.
 - **NNUE:** 768 inputs → 256 hidden (shared weights, two perspectives) → SCReLU → 1 output, with 8 output buckets by piece count, `(n-2)/4`. Feature = `(color^persp)*384 + type*64 + (persp==WHITE ? sq : sq^56)`. Quantization QA=255, QB=64, SCALE=400. W1 and W2 are clipped to ±1.98 during training; the NEON kernel relies on |W2_q| ≤ 127. File layout: `w1[768][H] i16, b1[H] i16, w2[8][2H] i16, b2[32] i32` (only 8 used), 402,048 bytes for H=256.
-- **Trainer:** AdamW (β 0.9/0.999, wd 0.01), batch 16384, cosine LR 1e-3 → 1e-5. Target = `(1-wdl)*sigmoid(score/400) + wdl*result`. 1% (≤200K) held out for validation. Throughput is about 230K samples/s per thread.
+- **Trainer:** AdamW (β 0.9/0.999, wd 0.01), batch 16384, cosine LR 1e-3 → 1e-5. Target = `(1-wdl)*sigmoid(score/400) + wdl*result`. The last 1% (≤200K) of the file is held out for validation (game-independent since Oct 16; before that it was a random split). Throughput is about 230K samples/s per thread on the M3.
 
 ## October 14 continuation
 
