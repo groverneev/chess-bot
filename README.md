@@ -17,11 +17,14 @@ cargo test --release
 `.cargo/config.toml` builds with `-C target-cpu=native`, so a binary is tuned for
 (and may only run on) the machine that built it.
 
-The build embeds `nets/default.nnue` if present, or the file named by
-`FERRUM_NET`. Without a network, Ferrum uses its hand-crafted evaluation.
+The build embeds `nets/default.nnue` (a 768→256×2→1 network trained on
+Ferrum's own self-play, about +157 Elo over the hand-crafted evaluation), or the
+file named by `FERRUM_NET`. If the file can't be read, Ferrum falls back to
+its hand-crafted evaluation.
 
 ```bash
-FERRUM_NET=path/to/net.nnue cargo build --release
+FERRUM_NET=path/to/net.nnue cargo build --release   # a different network
+FERRUM_NET=none cargo build --release               # hand-crafted evaluation only
 ```
 
 ## Using it

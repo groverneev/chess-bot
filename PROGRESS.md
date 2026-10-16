@@ -10,12 +10,12 @@ Machines: Apple M3 (aarch64, 8 cores, 16 GB, Rust 1.92) through October 14; Octo
 | Move generation | Legal-only bitboard movegen with check/pin masks. Magic sliders generated at **build time** (`build.rs`). Perft passes all 6 standard positions (~540 Mnps bulk). |
 | Search | PVS + iterative deepening + aspiration windows, lock-free shared TT (4-way buckets), Lazy SMP. Pruning: RFP, razoring, NMP, LMP, futility, SEE pruning, history pruning, IIR. Extensions: in-check, singular (incl. double ext + multicut + negative ext). LMR with history/killer/check/cutnode adjustments. Quiescence with SEE + delta pruning. |
 | Ordering / history | Staged move picker (TT → good captures → quiets → bad captures); main, continuation (1 & 2 ply), capture histories; killer; countermove; pawn + non-pawn correction history. |
-| Eval | `hce.rs` = PeSTO tapered PSTs + bishop pair + drawish scaling. `nnue.rs` = NNUE inference, used automatically when a net is embedded at build time. |
+| Eval | **Default: NNUE `nets/default.nnue` (net1m-e8, Oct 16), +157 Elo over HCE.** `hce.rs` = PeSTO tapered PSTs + bishop pair + drawish scaling, used when no net is embedded. |
 | UCI | `uci, isready, ucinewgame, position, go (wtime/btime/winc/binc/movestogo/movetime/depth/nodes/infinite), stop, quit, setoption (Hash, Threads, Move Overhead, Clear Hash)`, plus `d`, `eval`, `perft N`, `bench [depth]`. |
 | Tests | `cargo test --release`: 9 tests covering perft, staged-gen partition, incremental hash, SEE, trainer input validation, partial-batch gradients, small-dataset training, and mirror augmentation. |
-| Sanity | 100-game self-play at 2+0.02: no crashes, illegal moves, or time losses. Finds KQK/KRK mates. |
+| Sanity | 100-game self-play at 2+0.02: no crashes, illegal moves, or time losses. Finds KQK/KRK mates. Bench signature (depth 12, default net): **2,494,005 nodes**; HCE build (`FERRUM_NET=none cargo build --release`): 2,430,733. |
 
-**The first real-data NNUE pilot has been trained, but rejected in testing.** The default build still uses HCE; no `nets/default.nnue` is installed.
+**NNUE is now the default** (`nets/default.nnue`, committed): SPRT vs HCE at 8+0.08 accepted H1 with **+156.6 ± 35.0 Elo**. See the October 16 section.
 Strength has **not** been measured against any external engine yet.
 
 ## File map
@@ -40,7 +40,8 @@ Strength has **not** been measured against any external engine yet.
 ## Commands
 
 ```bash
-cargo build --release                         # HCE (no nets/default.nnue present)
+cargo build --release                         # embeds nets/default.nnue
+FERRUM_NET=none cargo build --release         # HCE only (any unreadable path = no net)
 FERRUM_NET=path/to.nnue cargo build --release  # embed a specific net
 cargo test --release
 ./target/release/ferrum bench 12              # deterministic node count + nps
@@ -74,9 +75,32 @@ scripts/pvcheck.py target/release/ferrum      # bestmove must match the last rep
 - Fixed-size comparison: **28 wins / 54 losses / 18 draws**, 37/100 points. Fastchess reported relative Elo **−92.46 ± 58.38** at `2+0.02`, one thread, 16 MB hash. This is a short-time-control pilot, not an SPRT or an absolute Elo rating. 50 paired UHO openings, seed `20261014`, concurrency 4; match took 2m31s. No recorded game ended by crash, illegal move, or time forfeit.
 - Both builds produced `Bestmove does not match beginning of last PV` warnings (125 total). Investigate interrupted-iteration reporting in `src/search.rs` separately before claiming clean UCI diagnostics.
 - Depth-12 bench: HCE 2,430,733 nodes / ~5.00M nps; pilot 2,390,715 nodes / ~4.25M nps. Different evaluation changes the search tree, so this is not a pure inference-speed comparison.
-- **Decision: keep HCE as default.** Preserve the pilot only for reproducibility; expand gen0 toward the planned 12–15M positions, retrain, and test again before promotion.
+- **Decision: keep HCE as default.** Preserve the pilot only for reproducibility; expand gen0 toward the planned 12–15M positions, retrain, and test again before promotion. (Superseded October 16.)
 - SHA-256 of gen0 data: `9c7395b3271906edba8870aa3b51bcb16350a7ddb8bc9b611eec24ac5bc94f49`.
 - SHA-256 of pilot final network: `6406cfc5d51243bf4609d13464a5c49d3cd892a4cf4950da8371bcd85313a69c`.
+
+## October 16 continuation
+
+Work is on branch `ferrum-continue`. The October 14 `data/`, `bins/`, `tools/` and `nets/net0-pilot` did not carry over (fresh container), so gen0 below is a **new** dataset.
+
+- **Fixed the bestmove/PV mismatch.** The root set `best_move` on aspiration fail-highs, but the re-search reset `pv_len[0]`; a stop before any move raised alpha again left `best_move` unreported. The root now keeps `root_pv`, updated together with `best_move`. `scripts/pvcheck.py`: 9/600 mismatches before, 0/600 after; 0 warnings in the 232-game SPRT below.
+- **AVX2 SCReLU kernel** (`nnue.rs`): bit-identical to scalar (same bench nodes), about 16% higher bench nps on the Xeon.
+- **Trainer validation was leaking.** The random 1% split shared games with training data, so validation loss tracked training loss. With a game-independent holdout (last 1% of the file), a 30-epoch run on 3M positions has its best validation loss at epoch 2–3 and then rises steadily (0.00663 → 0.00728) while training loss keeps falling (0.0061 → 0.0037). That overfitting likely contributed to the pilot's loss.
+- **Mirror augmentation** (`train ... mirror`): flips each position across the d/e boundary with probability 1/2 per batch. Lowers held-out loss and delays overfitting.
+- **gen0 data:** `ferrum datagen 4 3000000 data/gen0.bin 5000` with the HCE build → 3,000,361 positions from 30,940 games in 4,530 s (~660 pos/s on 4 Xeon cores). SHA-256 `3a26e4f0b76069d06daeb7e6f5fa3821390baa8510eb3b66e7371c899934d4bb`. 2,970,358 train / 30,003 validation positions.
+- Held-out validation loss (final epoch; lower is better), all lr 1e-3 → 1e-5, wdl 0.25:
+
+  | Run | Epochs | Mirror | Val loss |
+  |---|---|---|---|
+  | net1 | 30 | no | 0.007283 |
+  | net1-e4 | 4 | no | 0.006495 |
+  | net1m-e4 | 4 | yes | 0.006452 |
+  | **net1m-e8** | 8 | yes | **0.006371** |
+  | net1m-e12 | 12 | yes | 0.006397 |
+
+- **SPRT net1m-e8 vs HCE**, 8+0.08, 1 thread, 16 MB, UHO book, concurrency 4, bounds [0, 10]: **H1 accepted** after 232 games. +127 −29 =76, **Elo +156.56 ± 35.04**, nElo 229.1 ± 44.7, pentanomial [0, 11, 25, 51, 29]. No crashes, time losses, illegal moves, or PV warnings. 25 minutes.
+- **Promoted** `nets/net1m-e8/final.nnue` to `nets/default.nnue` (SHA-256 `4912a4fc4bfa370ab366e1418cf3e73f71c3c63f28c8d5164001b2b74307a948`). A plain `cargo build --release` produces a binary byte-identical to the tested candidate.
+- Reproduce: `ferrum train data/gen0.bin nets/net1m-e8 8 0.001 0.25 4 mirror` (deterministic given the same data and thread count).
 
 ## Measured numbers
 
@@ -86,9 +110,9 @@ scripts/pvcheck.py target/release/ferrum      # bestmove must match the last rep
 
 ## Next steps (planned order)
 
-1. **Generate gen0 data.** Resume with `bins/ferrum-datagen0 datagen 7 <N> data/gen0.bin 5000` (appends). Plan was ~12–15M positions total, about 2 hours, then stop. Already have 0.81M.
-2. **Train net0 on the expanded dataset:** `ferrum train data/gen0.bin nets/net0 30`. Build a candidate with `FERRUM_NET=nets/net0/final.nnue cargo build --release`, save its binary, and test against HCE. Install `nets/default.nnue` only after a convincing strength gain; the 0.81M-position pilot regressed.
-3. **gen1 data:** self-play with the net0 engine (30M+ positions). Train net1 on gen1 (optionally + gen0). Consider H=512, horizontal mirroring, and later king input buckets; SPRT each change.
+1. ~~Generate gen0 data and train a net that beats HCE.~~ Done October 16 (3M positions, +157 Elo).
+2. **gen1 data:** self-play with the default (NNUE) engine; as many positions as time allows (10M+ ideally; on the M3 at ~1,500 pos/s that is ~2 hours). Train net2 on gen1 (+ gen0 if kept), choosing epochs by held-out validation loss, then SPRT against the current default. Note that the trainer's 1-epoch-on-3M overfitting curve means more data will matter more than more epochs.
+3. **Architecture:** H=512, king input buckets; SPRT each change. Mirror augmentation is already in.
 4. **Search improvements** (SPRT each, after NNUE is in, since tuning depends on eval): ProbCut; continuation history at ply 4; deeper/shallower re-search after LMR; using eval differences to update the previous move's quiet history; check-extension variants; pruning margins and LMR constants (or SPSA); quiet check-evasion pruning in qsearch.
 5. **Calibrate strength** against Stockfish with `UCI_LimitStrength` / `UCI_Elo` (would need building Stockfish locally) to give the user an Elo estimate. Then write the README.
 
@@ -98,5 +122,4 @@ scripts/pvcheck.py target/release/ferrum      # bestmove must match the last rep
 - `see_ge` returns `0 >= threshold` for castling, en passant and promotions (Stockfish-style simplification).
 - TT stores eval-only entries (`BOUND_NONE`) at nodes without a TT hit, so `hashfull` fills quickly; this is intended.
 - No pondering, MultiPV, Chess960, Syzygy, or `EvalFile` option yet.
-- Interrupted searches can produce bestmove/last-PV reporting mismatches in both HCE and NNUE builds; see the October 14 match logs.
-- The repo has an initial commit (`f0b7861`). No commits were created during the October 14 continuation; the user has not asked for new commits.
+- October 16 commits are on branch `ferrum-continue` (not merged into `main`, no PR).
