@@ -125,6 +125,8 @@ pub struct Worker {
     limits: Limits,
     root_nodes: Box<[[u64; 64]; 64]>,
     pub best_move: Move,
+    /// PV of `best_move`, updated together with it so reports never disagree with the move played.
+    root_pv: Vec<Move>,
     pub best_score: i32,
     root_score: i32,
     pub completed_depth: i32,
@@ -158,6 +160,7 @@ impl Worker {
             limits: Limits::default(),
             root_nodes: Box::new([[0; 64]; 64]),
             best_move: Move::NONE,
+            root_pv: Vec::with_capacity(MAX_PLY),
             best_score: 0,
             root_score: 0,
             completed_depth: 0,
@@ -302,6 +305,8 @@ impl Worker {
             return (Move::NONE, if root.in_check() { -MATE } else { 0 });
         }
         self.best_move = legal.moves[0];
+        self.root_pv.clear();
+        self.root_pv.push(self.best_move);
 
         let max_depth = self.limits.depth.unwrap_or(MAX_PLY as i32 - 1).clamp(1, MAX_PLY as i32 - 1);
         let mut score = 0;
@@ -346,9 +351,6 @@ impl Worker {
             }
             self.completed_depth = depth;
             self.best_score = score;
-            if self.pv_len[0] > 0 {
-                self.best_move = self.pv[0][0];
-            }
             self.shared.nodes[self.id].0.store(self.nodes, Relaxed);
 
             if self.id != 0 {
@@ -372,7 +374,7 @@ impl Worker {
         }
         if self.id == 0 {
             // An interrupted iteration may have produced a new best move; report its line.
-            if !self.silent && self.completed_depth > 0 && self.pv_len[0] > 0 && self.best_move != prev_best {
+            if !self.silent && self.completed_depth > 0 && self.best_move != prev_best {
                 self.report(self.completed_depth, self.root_score);
             }
             while self.limits.infinite && !self.stopped() {
@@ -386,7 +388,7 @@ impl Worker {
     fn report(&self, depth: i32, score: i32) {
         let ms = self.tm.elapsed_ms().max(1);
         let nodes = self.shared.total_nodes().max(self.nodes);
-        let pv: Vec<String> = self.pv[0][..self.pv_len[0]].iter().map(|m| m.to_uci()).collect();
+        let pv: Vec<String> = self.root_pv.iter().map(|m| m.to_uci()).collect();
         println!(
             "info depth {depth} seldepth {} score {} nodes {nodes} nps {} hashfull {} time {ms} pv {}",
             self.seldepth,
@@ -710,6 +712,8 @@ impl Worker {
                     if root {
                         self.root_score = score;
                         self.best_move = m;
+                        self.root_pv.clear();
+                        self.root_pv.extend_from_slice(&self.pv[0][..self.pv_len[0]]);
                     }
                     if score >= beta {
                         break;
