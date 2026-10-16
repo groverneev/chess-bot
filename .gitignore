@@ -3,5 +3,5 @@
 /data
 /bins
 *.pgn
-/nets/test
-/nets/net0-pilot
+/nets/*
+!/nets/default.nnue
