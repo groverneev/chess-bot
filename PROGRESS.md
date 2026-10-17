@@ -120,6 +120,13 @@ Work is on branch `ferrum-continue`. The October 14 `data/`, `bins/`, `tools/` a
 - Reproduce: `ferrum train data/gen012.bin nets/net3m-e10 10 0.001 0.25 4 mirror`.
 - Gains per added 3M positions are shrinking (+69, then +51) but still large. Next levers: keep adding data, then try H=512 once the dataset is big enough to support it.
 
+### Fourth generation (net4m-e12, NOT promoted: SPRT unresolved)
+
+- **gen3 data:** `ferrum datagen 4 3000000 data/gen3.bin 5000` with the net3m-e10 default build → 3,000,327 positions from 31,592 games in 4,392 s. SHA-256 `76e7816fe494ce7f4ffcba812d259ce3b9a84b5ed3a711bd5e1f905d9bb43812`.
+- Trained on `cat gen0.bin gen1.bin gen2.bin gen3.bin > gen0123.bin` (12.0M positions; validation = last 120K, i.e. gen3 games). Final held-out loss: 10 epochs 0.008917; **12 epochs 0.008891** (candidate). Reproduce: `ferrum train data/gen0123.bin nets/net4m-e12 12 0.001 0.25 4 mirror`. Bench depth 12 with this net: 2,146,422 nodes.
+- **SPRT net4m-e12 vs net3m-e10**, 8+0.08, bounds [0, 10]: **stopped unresolved** when the 2-hour background job limit killed it at 1,074 games. Last fastchess report (1,000 games): +306 −255 =439, **Elo +17.73 ± 14.58**, nElo 26.3 ± 21.5, LOS 99.15%, pentanomial [22, 107, 201, 138, 32], **LLR 1.75** (accept at 2.94). fastchess's saved state at 1,060 games: +325 −268 =467. No crashes, time losses, illegal moves, or PV warnings.
+- **Decision: net3m-e10 stays the default.** net4m-e12 is probably a small gain (+10 to +25 Elo) but did not meet the acceptance bar the other nets passed. Options: resume this SPRT (`tools/fastchess/fastchess -config file=data/net4m-e12-vs-net3m-e10-config.json`, if `data/` survives), or, better, generate more data before the next candidate so the gain is large enough to resolve quickly. Diminishing returns (+69, +51, ~+18) suggest the 256-wide net is approaching its limit on this data; H=512 is the natural next experiment.
+
 ## Measured numbers
 
 - Bench (depth 13, HCE, idle machine): 3.65M nodes, ~6.1M nps single thread.
@@ -129,7 +136,7 @@ Work is on branch `ferrum-continue`. The October 14 `data/`, `bins/`, `tools/` a
 ## Next steps (planned order)
 
 1. ~~Generate gen0 data and train a net that beats HCE.~~ Done October 16 (3M positions, +157 Elo).
-2. ~~gen1 data + net2; gen2 + net3.~~ Done October 16 (+69, then +51 Elo). **Continue the loop:** gen3 with the net3m-e10 engine, train on all data, SPRT against the default. More data is clearly the main lever (3M→6M gave +69). The gen0/gen1 files lived only in the cloud container, so on a new machine regenerate rather than expect them to exist.
+2. ~~gen1 data + net2; gen2 + net3.~~ Done October 16 (+69, then +51 Elo). gen3 + net4 trained Oct 17 but its SPRT was unresolved at ~+18 Elo (see above). **Next:** more data (gen4 with the default engine) and/or H=512, SPRT against net3m-e10. More data is clearly the main lever (3M→6M gave +69). The gen0/gen1 files lived only in the cloud container, so on a new machine regenerate rather than expect them to exist.
 3. **Architecture:** H=512, king input buckets; SPRT each change. Mirror augmentation is already in.
 4. **Search improvements** (SPRT each, after NNUE is in, since tuning depends on eval): ProbCut; continuation history at ply 4; deeper/shallower re-search after LMR; using eval differences to update the previous move's quiet history; check-extension variants; pruning margins and LMR constants (or SPSA); quiet check-evasion pruning in qsearch.
 5. **Calibrate strength** against Stockfish with `UCI_LimitStrength` / `UCI_Elo` (would need building Stockfish locally) to give the user an Elo estimate. Then write the README.
